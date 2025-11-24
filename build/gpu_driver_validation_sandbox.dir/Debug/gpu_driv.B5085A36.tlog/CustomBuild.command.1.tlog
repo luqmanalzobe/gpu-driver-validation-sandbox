@@ -1,0 +1,10 @@
+^C:\USERS\DAYAA\GPU-DRIVER-VALIDATION-SANDBOX\CMAKELISTS.TXT
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/Users/dayaa/gpu-driver-validation-sandbox -BC:/Users/dayaa/gpu-driver-validation-sandbox/build --check-stamp-file C:/Users/dayaa/gpu-driver-validation-sandbox/build/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

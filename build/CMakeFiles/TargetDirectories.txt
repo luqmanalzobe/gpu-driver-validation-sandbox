@@ -1,0 +1,3 @@
+C:/Users/dayaa/gpu-driver-validation-sandbox/build/CMakeFiles/gpu_driver_validation_sandbox.dir
+C:/Users/dayaa/gpu-driver-validation-sandbox/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/dayaa/gpu-driver-validation-sandbox/build/CMakeFiles/ZERO_CHECK.dir
