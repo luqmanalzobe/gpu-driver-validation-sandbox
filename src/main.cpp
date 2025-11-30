@@ -32,10 +32,10 @@ int main() {
         //context.setScenario(ValidationScenario::Normal);
 
         // Misconfigured / over-conservative barrier:
-        context.setScenario(ValidationScenario::BadBarrier);
+        //context.setScenario(ValidationScenario::BadBarrier);
 
         // Brutal oversync (vkDeviceWaitIdle every frame):
-        //context.setScenario(ValidationScenario::OverSync);
+        context.setScenario(ValidationScenario::OverSync);
 
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
