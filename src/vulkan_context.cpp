@@ -142,9 +142,12 @@ VulkanContext::VulkanContext(GLFWwindow* window)
     createFramebuffers();
     createCommandPool();
     createVertexBuffer();
-    createCommandBuffers();    // allocate
-    createTimestampQueryPool();// GPU timing
-    createSyncObjects();
+    createCommandBuffers();     // allocate
+    createTimestampQueryPool(); // GPU timing
+    createSyncObjects();        // uses swapchainImages.size()
+
+    // NEW: resources for compute->fragment cache bug scenario
+    createCacheBugResources();
 }
 
 VulkanContext::~VulkanContext() {
@@ -152,10 +155,18 @@ VulkanContext::~VulkanContext() {
         vkDeviceWaitIdle(device);
     }
 
+    // Destroy cache bug resources first
+    destroyCacheBugResources();
+
+    // Destroy per-frame sync objects
     for (size_t i = 0; i < imageAvailableSemaphores.size(); ++i) {
         vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
-        vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
         vkDestroyFence(device, inFlightFences[i], nullptr);
+    }
+
+    // Destroy per-image renderFinished semaphores
+    for (size_t i = 0; i < renderFinishedSemaphores.size(); ++i) {
+        vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
     }
 
     if (timestampQueryPool != VK_NULL_HANDLE) {
@@ -357,7 +368,7 @@ VkSurfaceFormatKHR VulkanContext::chooseSwapSurfaceFormat(
     return availableFormats[0];
 }
 
-// *** PRESENT MODE: try IMMEDIATE (no vsync), fallback to MAILBOX, then FIFO ***
+// Try IMMEDIATE (no vsync), fallback to MAILBOX, then FIFO
 VkPresentModeKHR VulkanContext::chooseSwapPresentMode(
     const std::vector<VkPresentModeKHR>& availablePresentModes) const {
 
@@ -485,8 +496,9 @@ void VulkanContext::createLogicalDevice() {
         throw std::runtime_error("Failed to create logical device");
     }
 
-    vkGetDeviceQueue(device, indices.graphicsFamily.value(), 0, &graphicsQueue);
-    vkGetDeviceQueue(device, indices.presentFamily.value(), 0, &presentQueue);
+    QueueFamilyIndices qf = findQueueFamilies(physicalDevice);
+    vkGetDeviceQueue(device, qf.graphicsFamily.value(), 0, &graphicsQueue);
+    vkGetDeviceQueue(device, qf.presentFamily.value(), 0, &presentQueue);
 }
 
 // -------- Swapchain + image views --------
@@ -900,9 +912,12 @@ void VulkanContext::createTimestampQueryPool() {
 }
 
 void VulkanContext::createSyncObjects() {
+    // Per-frame synchronization (acquire + CPU/GPU fence)
     imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
-    renderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
     inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+
+    // Per-swapchain-image "render finished" semaphores
+    renderFinishedSemaphores.resize(swapchainImages.size());
 
     VkSemaphoreCreateInfo sem{};
     sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -911,13 +926,495 @@ void VulkanContext::createSyncObjects() {
     fence.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fence.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
+    // Create per-frame semaphores + fences
     for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         if (vkCreateSemaphore(device, &sem, nullptr, &imageAvailableSemaphores[i]) != VK_SUCCESS ||
-            vkCreateSemaphore(device, &sem, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS ||
             vkCreateFence(device, &fence, nullptr, &inFlightFences[i]) != VK_SUCCESS) {
-            throw std::runtime_error("Failed to create sync objects");
+            throw std::runtime_error("Failed to create per-frame sync objects");
         }
     }
+
+    // Create one "renderFinished" semaphore per swapchain image
+    for (size_t i = 0; i < swapchainImages.size(); ++i) {
+        if (vkCreateSemaphore(device, &sem, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create per-image renderFinished semaphore");
+        }
+    }
+}
+
+// -------- NEW: Cache bug resources (image, descriptors, compute+graphics pipelines) --------
+
+void VulkanContext::createCacheBugResources() {
+    if (cacheResourcesCreated) return;
+
+    // 1) Create the shared image (storage + sampled)
+    VkImageCreateInfo imgInfo{};
+    imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imgInfo.imageType = VK_IMAGE_TYPE_2D;
+    imgInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    imgInfo.extent.width  = swapchainExtent.width;
+    imgInfo.extent.height = swapchainExtent.height;
+    imgInfo.extent.depth  = 1;
+    imgInfo.mipLevels     = 1;
+    imgInfo.arrayLayers   = 1;
+    imgInfo.samples       = VK_SAMPLE_COUNT_1_BIT;
+    imgInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
+    imgInfo.usage         =
+        VK_IMAGE_USAGE_STORAGE_BIT |
+        VK_IMAGE_USAGE_SAMPLED_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    imgInfo.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+    imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    if (vkCreateImage(device, &imgInfo, nullptr, &cacheImage) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create cache bug image");
+    }
+
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(device, cacheImage, &memReq);
+
+    VkMemoryAllocateInfo alloc{};
+    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc.allocationSize = memReq.size;
+    alloc.memoryTypeIndex = findMemoryType(
+        memReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    );
+
+    if (vkAllocateMemory(device, &alloc, nullptr, &cacheImageMemory) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate cache bug image memory");
+    }
+    vkBindImageMemory(device, cacheImage, cacheImageMemory, 0);
+
+    // Create image view
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = cacheImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    viewInfo.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel   = 0;
+    viewInfo.subresourceRange.levelCount     = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount     = 1;
+
+    if (vkCreateImageView(device, &viewInfo, nullptr, &cacheImageView) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create cache bug image view");
+    }
+
+    // Create sampler
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter    = VK_FILTER_LINEAR;
+    samplerInfo.minFilter    = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy    = 1.0f;
+    samplerInfo.borderColor      = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable    = VK_FALSE;
+    samplerInfo.mipmapMode       = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+
+    if (vkCreateSampler(device, &samplerInfo, nullptr, &cacheSampler) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create cache bug sampler");
+    }
+
+    // Transition image from UNDEFINED -> GENERAL for compute writes (one-time command buffer)
+    VkCommandBufferAllocateInfo cbAlloc{};
+    cbAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbAlloc.commandPool = commandPool;
+    cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbAlloc.commandBufferCount = 1;
+
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(device, &cbAlloc, &cmd);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    VkImageMemoryBarrier initBarrier{};
+    initBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    initBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    initBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    initBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    initBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    initBarrier.image = cacheImage;
+    initBarrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    initBarrier.subresourceRange.baseMipLevel   = 0;
+    initBarrier.subresourceRange.levelCount     = 1;
+    initBarrier.subresourceRange.baseArrayLayer = 0;
+    initBarrier.subresourceRange.layerCount     = 1;
+    initBarrier.srcAccessMask = 0;
+    initBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(
+        cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0,
+        0, nullptr,
+        0, nullptr,
+        1, &initBarrier
+    );
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+
+    vkQueueSubmit(graphicsQueue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(graphicsQueue);
+    vkFreeCommandBuffers(device, commandPool, 1, &cmd);
+
+    // 2) Descriptor pool
+    VkDescriptorPoolSize poolSizes[2]{};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    poolSizes[0].descriptorCount = 1;
+    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[1].descriptorCount = 1;
+
+    VkDescriptorPoolCreateInfo dp{};
+    dp.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dp.poolSizeCount = 2;
+    dp.pPoolSizes = poolSizes;
+    dp.maxSets = 2;
+
+    if (vkCreateDescriptorPool(device, &dp, nullptr, &descriptorPool) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create descriptor pool for cache bug");
+    }
+
+    // 3) Descriptor set layouts
+
+    // Compute: storage image at binding 0
+    VkDescriptorSetLayoutBinding computeBinding{};
+    computeBinding.binding = 0;
+    computeBinding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    computeBinding.descriptorCount = 1;
+    computeBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    computeBinding.pImmutableSamplers = nullptr;
+
+    VkDescriptorSetLayoutCreateInfo computeLayoutInfo{};
+    computeLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    computeLayoutInfo.bindingCount = 1;
+    computeLayoutInfo.pBindings = &computeBinding;
+
+    if (vkCreateDescriptorSetLayout(device, &computeLayoutInfo, nullptr, &cacheComputeSetLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create cache compute descriptor set layout");
+    }
+
+    // Graphics: combined image sampler at binding 0
+    VkDescriptorSetLayoutBinding graphicsBinding{};
+    graphicsBinding.binding = 0;
+    graphicsBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    graphicsBinding.descriptorCount = 1;
+    graphicsBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    graphicsBinding.pImmutableSamplers = nullptr;
+
+    VkDescriptorSetLayoutCreateInfo graphicsLayoutInfo{};
+    graphicsLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    graphicsLayoutInfo.bindingCount = 1;
+    graphicsLayoutInfo.pBindings = &graphicsBinding;
+
+    if (vkCreateDescriptorSetLayout(device, &graphicsLayoutInfo, nullptr, &cacheGraphicsSetLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create cache graphics descriptor set layout");
+    }
+
+    // 4) Pipeline layouts
+
+    // Compute layout with push constant (float time)
+    VkPushConstantRange pc{};
+    pc.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pc.offset = 0;
+    pc.size = sizeof(float);
+
+    VkPipelineLayoutCreateInfo computePL{};
+    computePL.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    computePL.setLayoutCount = 1;
+    computePL.pSetLayouts = &cacheComputeSetLayout;
+    computePL.pushConstantRangeCount = 1;
+    computePL.pPushConstantRanges = &pc;
+
+    if (vkCreatePipelineLayout(device, &computePL, nullptr, &cacheComputePipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create cache compute pipeline layout");
+    }
+
+    // Graphics layout
+    VkPipelineLayoutCreateInfo graphicsPL{};
+    graphicsPL.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    graphicsPL.setLayoutCount = 1;
+    graphicsPL.pSetLayouts = &cacheGraphicsSetLayout;
+
+    if (vkCreatePipelineLayout(device, &graphicsPL, nullptr, &cacheGraphicsPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create cache graphics pipeline layout");
+    }
+
+    // 5) Create pipelines
+
+    // Compute shader
+    auto compCode = readFile("../../shaders/cache_bug.comp.spv");
+    VkShaderModuleCreateInfo compInfo{};
+    compInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    compInfo.codeSize = compCode.size();
+    compInfo.pCode = reinterpret_cast<const uint32_t*>(compCode.data());
+
+    VkShaderModule compModule;
+    if (vkCreateShaderModule(device, &compInfo, nullptr, &compModule) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create cache_bug compute shader module");
+    }
+
+    VkPipelineShaderStageCreateInfo compStage{};
+    compStage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    compStage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    compStage.module = compModule;
+    compStage.pName = "main";
+
+    VkComputePipelineCreateInfo cp{};
+    cp.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cp.stage = compStage;
+    cp.layout = cacheComputePipelineLayout;
+
+    if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp, nullptr, &cacheComputePipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, compModule, nullptr);
+        throw std::runtime_error("Failed to create cache compute pipeline");
+    }
+
+    vkDestroyShaderModule(device, compModule, nullptr);
+
+    // Graphics shaders (fullscreen triangle VS + sampling FS)
+    auto vsCode = readFile("../../shaders/cache_fullscreen.vert.spv");
+    auto fsCode = readFile("../../shaders/cache_bug.frag.spv");
+
+    VkShaderModuleCreateInfo vsInfo{};
+    vsInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    vsInfo.codeSize = vsCode.size();
+    vsInfo.pCode = reinterpret_cast<const uint32_t*>(vsCode.data());
+
+    VkShaderModule vsModule;
+    if (vkCreateShaderModule(device, &vsInfo, nullptr, &vsModule) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create cache fullscreen VS module");
+    }
+
+    VkShaderModuleCreateInfo fsInfo{};
+    fsInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    fsInfo.codeSize = fsCode.size();
+    fsInfo.pCode = reinterpret_cast<const uint32_t*>(fsCode.data());
+
+    VkShaderModule fsModule;
+    if (vkCreateShaderModule(device, &fsInfo, nullptr, &fsModule) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, vsModule, nullptr);
+        throw std::runtime_error("Failed to create cache bug FS module");
+    }
+
+    VkPipelineShaderStageCreateInfo gStages[2]{};
+    gStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    gStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    gStages[0].module = vsModule;
+    gStages[0].pName = "main";
+
+    gStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    gStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    gStages[1].module = fsModule;
+    gStages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount = 0;
+    vi.vertexAttributeDescriptionCount = 0;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    ia.primitiveRestartEnable = VK_FALSE;
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width  = static_cast<float>(swapchainExtent.width);
+    viewport.height = static_cast<float>(swapchainExtent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = swapchainExtent;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.pViewports = &viewport;
+    vp.scissorCount = 1;
+    vp.pScissors = &scissor;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.depthClampEnable = VK_FALSE;
+    rs.rasterizerDiscardEnable = VK_FALSE;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_BACK_BIT;
+    rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rs.depthBiasEnable = VK_FALSE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms2{};
+    ms2.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms2.sampleShadingEnable = VK_FALSE;
+    ms2.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState cbAttach{};
+    cbAttach.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT |
+        VK_COLOR_COMPONENT_G_BIT |
+        VK_COLOR_COMPONENT_B_BIT |
+        VK_COLOR_COMPONENT_A_BIT;
+    cbAttach.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.logicOpEnable = VK_FALSE;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cbAttach;
+
+    VkGraphicsPipelineCreateInfo gp{};
+    gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.stageCount = 2;
+    gp.pStages = gStages;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms2;
+    gp.pDepthStencilState = nullptr;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = nullptr;
+    gp.layout = cacheGraphicsPipelineLayout;
+    gp.renderPass = renderPass;
+    gp.subpass = 0;
+
+    if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gp, nullptr, &cacheGraphicsPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(device, vsModule, nullptr);
+        vkDestroyShaderModule(device, fsModule, nullptr);
+        throw std::runtime_error("Failed to create cache graphics pipeline");
+    }
+
+    vkDestroyShaderModule(device, vsModule, nullptr);
+    vkDestroyShaderModule(device, fsModule, nullptr);
+
+    // 6) Descriptor sets
+
+    VkDescriptorSetAllocateInfo dsAlloc{};
+    dsAlloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsAlloc.descriptorPool = descriptorPool;
+    dsAlloc.descriptorSetCount = 1;
+    dsAlloc.pSetLayouts = &cacheComputeSetLayout;
+
+    if (vkAllocateDescriptorSets(device, &dsAlloc, &cacheComputeSet) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate cache compute descriptor set");
+    }
+
+    dsAlloc.pSetLayouts = &cacheGraphicsSetLayout;
+    if (vkAllocateDescriptorSets(device, &dsAlloc, &cacheGraphicsSet) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to allocate cache graphics descriptor set");
+    }
+
+    // Update compute set
+    VkDescriptorImageInfo computeImg{};
+    computeImg.imageView = cacheImageView;
+    computeImg.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet writeCompute{};
+    writeCompute.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writeCompute.dstSet = cacheComputeSet;
+    writeCompute.dstBinding = 0;
+    writeCompute.descriptorCount = 1;
+    writeCompute.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writeCompute.pImageInfo = &computeImg;
+
+    // Update graphics set
+    VkDescriptorImageInfo graphicsImg{};
+    graphicsImg.sampler = cacheSampler;
+    graphicsImg.imageView = cacheImageView;
+    graphicsImg.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet writeGraphics{};
+    writeGraphics.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writeGraphics.dstSet = cacheGraphicsSet;
+    writeGraphics.dstBinding = 0;
+    writeGraphics.descriptorCount = 1;
+    writeGraphics.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writeGraphics.pImageInfo = &graphicsImg;
+
+    VkWriteDescriptorSet writes[] = { writeCompute, writeGraphics };
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+    cacheResourcesCreated = true;
+}
+
+void VulkanContext::destroyCacheBugResources() {
+    if (!cacheResourcesCreated) return;
+
+    if (cacheComputePipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, cacheComputePipeline, nullptr);
+        cacheComputePipeline = VK_NULL_HANDLE;
+    }
+
+    if (cacheGraphicsPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(device, cacheGraphicsPipeline, nullptr);
+        cacheGraphicsPipeline = VK_NULL_HANDLE;
+    }
+
+    if (cacheComputePipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, cacheComputePipelineLayout, nullptr);
+        cacheComputePipelineLayout = VK_NULL_HANDLE;
+    }
+
+    if (cacheGraphicsPipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, cacheGraphicsPipelineLayout, nullptr);
+        cacheGraphicsPipelineLayout = VK_NULL_HANDLE;
+    }
+
+    if (cacheComputeSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device, cacheComputeSetLayout, nullptr);
+        cacheComputeSetLayout = VK_NULL_HANDLE;
+    }
+
+    if (cacheGraphicsSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(device, cacheGraphicsSetLayout, nullptr);
+        cacheGraphicsSetLayout = VK_NULL_HANDLE;
+    }
+
+    if (descriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+        descriptorPool = VK_NULL_HANDLE;
+    }
+
+    if (cacheSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(device, cacheSampler, nullptr);
+        cacheSampler = VK_NULL_HANDLE;
+    }
+
+    if (cacheImageView != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, cacheImageView, nullptr);
+        cacheImageView = VK_NULL_HANDLE;
+    }
+
+    if (cacheImage != VK_NULL_HANDLE) {
+        vkDestroyImage(device, cacheImage, nullptr);
+        cacheImage = VK_NULL_HANDLE;
+    }
+
+    if (cacheImageMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, cacheImageMemory, nullptr);
+        cacheImageMemory = VK_NULL_HANDLE;
+    }
+
+    cacheResourcesCreated = false;
 }
 
 // -------- Command buffer recording (scenario-aware) --------
@@ -944,47 +1441,133 @@ void VulkanContext::recordCommandBuffer(uint32_t imageIndex) {
         );
     }
 
-    VkRenderPassBeginInfo rp{};
-    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp.renderPass = renderPass;
-    rp.framebuffer = swapchainFramebuffers[imageIndex];
-    rp.renderArea.offset = {0, 0};
-    rp.renderArea.extent = swapchainExtent;
+    // === NEW: Cache bug scenarios ===
+    if (scenario == ValidationScenario::CacheBug_Bad ||
+        scenario == ValidationScenario::CacheBug_Fixed) {
 
-    VkClearValue clearColor = {{{0.05f, 0.05f, 0.12f, 1.0f}}};
-    rp.clearValueCount = 1;
-    rp.pClearValues = &clearColor;
+        // 1) COMPUTE PASS: write into cacheImage
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cacheComputePipeline);
+        vkCmdBindDescriptorSets(cmd,
+                                VK_PIPELINE_BIND_POINT_COMPUTE,
+                                cacheComputePipelineLayout,
+                                0, 1, &cacheComputeSet,
+                                0, nullptr);
 
-    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        // push time value
+        vkCmdPushConstants(cmd,
+                           cacheComputePipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT,
+                           0,
+                           sizeof(float),
+                           &cacheTime);
 
-    // BadBarrier scenario: overly conservative pipeline barrier (full stall)
-    if (scenario == ValidationScenario::BadBarrier) {
-        VkMemoryBarrier barrier{};
-        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER; 
-        barrier.srcAccessMask =
-            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        barrier.dstAccessMask =
-            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        uint32_t groupCountX = (swapchainExtent.width  + 15) / 16;
+        uint32_t groupCountY = (swapchainExtent.height + 15) / 16;
+        vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
 
-        vkCmdPipelineBarrier(
-            cmd,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-            0,
-            1, &barrier,
-            0, nullptr,
-            0, nullptr
-        );
+        // 2) Barrier (only in fixed scenario)
+        if (scenario == ValidationScenario::CacheBug_Fixed) {
+            VkImageMemoryBarrier imgBarrier{};
+            imgBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            imgBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;   // compute writes
+            imgBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;    // fragment reads
+            imgBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            imgBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imgBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            imgBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            imgBarrier.image = cacheImage;
+            imgBarrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+            imgBarrier.subresourceRange.baseMipLevel   = 0;
+            imgBarrier.subresourceRange.levelCount     = 1;
+            imgBarrier.subresourceRange.baseArrayLayer = 0;
+            imgBarrier.subresourceRange.layerCount     = 1;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,    // src
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,   // dst
+                0,
+                0, nullptr,
+                0, nullptr,
+                1, &imgBarrier
+            );
+        } else {
+            // CacheBug_Bad: NO barrier -> fragment may see stale cached data.
+        }
+
+        // 3) GRAPHICS PASS: sample cacheImage in fullscreen triangle
+        VkRenderPassBeginInfo rp{};
+        rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp.renderPass = renderPass;
+        rp.framebuffer = swapchainFramebuffers[imageIndex];
+        rp.renderArea.offset = {0, 0};
+        rp.renderArea.extent = swapchainExtent;
+
+        VkClearValue clearColor = {{{0.05f, 0.05f, 0.12f, 1.0f}}};
+        rp.clearValueCount = 1;
+        rp.pClearValues = &clearColor;
+
+        vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cacheGraphicsPipeline);
+        vkCmdBindDescriptorSets(cmd,
+                                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                cacheGraphicsPipelineLayout,
+                                0, 1, &cacheGraphicsSet,
+                                0, nullptr);
+
+        // fullscreen triangle: no vertex buffer, just 3 verts from gl_VertexIndex
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+
+        vkCmdEndRenderPass(cmd);
+
+    } else {
+        // === Original scenarios: Normal / BadBarrier / OverSync ===
+
+        VkRenderPassBeginInfo rp{};
+        rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp.renderPass = renderPass;
+        rp.framebuffer = swapchainFramebuffers[imageIndex];
+        rp.renderArea.offset = {0, 0};
+        rp.renderArea.extent = swapchainExtent;
+
+        VkClearValue clearColor = {{{0.05f, 0.05f, 0.12f, 1.0f}}};
+        rp.clearValueCount = 1;
+        rp.pClearValues = &clearColor;
+
+        vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+        // OverSync scenario: extra full-pipeline barrier = artificial stall
+        if (scenario == ValidationScenario::OverSync) {
+            VkMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            barrier.srcAccessMask =
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+            barrier.dstAccessMask =
+                VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0,
+                1, &barrier,
+                0, nullptr,
+                0, nullptr
+            );
+        }
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+
+        VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, offsets);
+
+        // Make the GPU do real work: many instances
+        const uint32_t instanceCount = 50000; // tune up/down as needed
+        vkCmdDraw(cmd, 3, instanceCount, 0, 0);
+
+        vkCmdEndRenderPass(cmd);
     }
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
-
-    VkDeviceSize offsets[] = {0};
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, offsets);
-
-    // Make the GPU do real work: many instances
-    const uint32_t instanceCount = 50000; // tune up/down as needed
-    vkCmdDraw(cmd, 3, instanceCount, 0, 0);
 
     // End GPU timestamps
     if (timestampQueryPool != VK_NULL_HANDLE) {
@@ -996,8 +1579,6 @@ void VulkanContext::recordCommandBuffer(uint32_t imageIndex) {
             base + 1
         );
     }
-
-    vkCmdEndRenderPass(cmd);
 
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
         throw std::runtime_error("Failed to record command buffer");
@@ -1011,6 +1592,12 @@ void VulkanContext::drawFrame() {
     std::chrono::high_resolution_clock::time_point cpuStart;
     if (profilingEnabled) {
         cpuStart = std::chrono::high_resolution_clock::now();
+    }
+
+    // Simple animation time for cache scenario
+    if (scenario == ValidationScenario::CacheBug_Bad ||
+        scenario == ValidationScenario::CacheBug_Fixed) {
+        cacheTime += 0.016f; // ~60 FPS step
     }
 
     vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
@@ -1036,19 +1623,21 @@ void VulkanContext::drawFrame() {
 
     vkResetFences(device, 1, &inFlightFences[currentFrame]);
 
-    VkSemaphore waitSem[] = { imageAvailableSemaphores[currentFrame] };
+    VkSemaphore waitSem[]   = { imageAvailableSemaphores[currentFrame] };
     VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
-    VkSemaphore signalSem[] = { renderFinishedSemaphores[currentFrame] };
+
+    // IMPORTANT: signal per-image "render finished" semaphore
+    VkSemaphore signalSem[] = { renderFinishedSemaphores[imageIndex] };
 
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.waitSemaphoreCount = 1;
-    submit.pWaitSemaphores = waitSem;
-    submit.pWaitDstStageMask = waitStages;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &commandBuffers[imageIndex];
+    submit.waitSemaphoreCount   = 1;
+    submit.pWaitSemaphores      = waitSem;
+    submit.pWaitDstStageMask    = waitStages;
+    submit.commandBufferCount   = 1;
+    submit.pCommandBuffers      = &commandBuffers[imageIndex];
     submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores = signalSem;
+    submit.pSignalSemaphores    = signalSem;
 
     if (vkQueueSubmit(graphicsQueue, 1, &submit, inFlightFences[currentFrame]) != VK_SUCCESS) {
         throw std::runtime_error("Failed to submit draw command buffer");
@@ -1062,13 +1651,23 @@ void VulkanContext::drawFrame() {
     VkSwapchainKHR swaps[] = { swapchain };
 
     VkPresentInfoKHR present{};
-    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = signalSem;
+    present.sType          = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     present.swapchainCount = 1;
-    present.pSwapchains = swaps;
-    present.pImageIndices = &imageIndex;
-    present.pResults = nullptr;
+    present.pSwapchains    = swaps;
+    present.pImageIndices  = &imageIndex;
+    present.pResults       = nullptr;
+
+    if (scenario == ValidationScenario::BadBarrier) {
+        // BROKEN SYNC SCENARIO:
+        // Present does NOT wait on the render-finished semaphore.
+        present.waitSemaphoreCount = 0;
+        present.pWaitSemaphores    = nullptr;
+    } else {
+        // Normal + OverSync + CacheBug scenarios: present waits on renderFinished semaphore
+        VkSemaphore presentWaitSem[] = { renderFinishedSemaphores[imageIndex] };
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores    = presentWaitSem;
+    }
 
     res = vkQueuePresentKHR(presentQueue, &present);
     if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
@@ -1118,12 +1717,17 @@ void VulkanContext::drawFrame() {
                 ? accumulatedGpuTimeMs / static_cast<double>(gpuFrameCounter)
                 : 0.0;
 
+            const char* scenarioName =
+                (scenario == ValidationScenario::Normal        ? "Normal" :
+                 scenario == ValidationScenario::BadBarrier    ? "BadBarrier" :
+                 scenario == ValidationScenario::OverSync      ? "OverSync" :
+                 scenario == ValidationScenario::CacheBug_Bad  ? "CacheBug_Bad" :
+                                                                 "CacheBug_Fixed");
+
             std::cout << "[Profiler] Avg CPU: " << avgCpuMs
                       << " ms  | Avg GPU: " << avgGpuMs
                       << " ms  | Scenario: "
-                      << (scenario == ValidationScenario::Normal    ? "Normal" :
-                          scenario == ValidationScenario::BadBarrier ? "BadBarrier" :
-                                                                       "OverSync")
+                      << scenarioName
                       << std::endl;
         }
     }

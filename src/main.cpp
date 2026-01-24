@@ -31,11 +31,17 @@ int main() {
         // Normal:
         //context.setScenario(ValidationScenario::Normal);
 
-        // Misconfigured / over-conservative barrier:
+        // Misconfigured / over-conservative barrier (present not waiting):
         //context.setScenario(ValidationScenario::BadBarrier);
 
         // Brutal oversync (vkDeviceWaitIdle every frame):
-        context.setScenario(ValidationScenario::OverSync);
+        //context.setScenario(ValidationScenario::OverSync);
+
+        // Cache bug - missing image barrier between compute + fragment:
+        context.setScenario(ValidationScenario::CacheBug_Bad);
+
+        // Cache bug - fixed (correct image barrier):
+        //context.setScenario(ValidationScenario::CacheBug_Fixed);
 
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
