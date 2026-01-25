@@ -10,6 +10,14 @@
 #include <algorithm>
 #include <fstream>
 #include <chrono>
+#include <filesystem>
+
+#ifdef _WIN32
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+#endif
 
 // --- Validation layers ---
 static const std::vector<const char*> VALIDATION_LAYERS = {
@@ -27,11 +35,44 @@ static const bool enableValidationLayers = false;
 static const bool enableValidationLayers = true;
 #endif
 
-// --- Helper: read SPIR-V file ---
+// ----------------- File helpers -----------------
+
+// Keep your original helper (fine to leave in the file)
 static std::vector<char> readFile(const std::string& filename) {
     std::ifstream file(filename, std::ios::ate | std::ios::binary);
     if (!file.is_open()) {
         throw std::runtime_error("Failed to open file: " + filename);
+    }
+
+    size_t fileSize = static_cast<size_t>(file.tellg());
+    std::vector<char> buffer(fileSize);
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+    file.close();
+    return buffer;
+}
+
+// NEW: resolve paths relative to the executable directory (robust for Nsight/VS/CLI)
+static std::filesystem::path getExeDir() {
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH];
+    DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (len == 0 || len == MAX_PATH) {
+        throw std::runtime_error("Failed to get executable path (GetModuleFileNameW).");
+    }
+    return std::filesystem::path(buf).parent_path();
+#else
+    return std::filesystem::current_path();
+#endif
+}
+
+static std::vector<char> readFileExeRelative(const std::filesystem::path& relativePathFromExe) {
+    const std::filesystem::path fullPath =
+        std::filesystem::weakly_canonical(getExeDir() / relativePathFromExe);
+
+    std::ifstream file(fullPath, std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open file: " + fullPath.string());
     }
 
     size_t fileSize = static_cast<size_t>(file.tellg());
@@ -643,8 +684,10 @@ void VulkanContext::createPipelineLayout() {
 }
 
 void VulkanContext::createGraphicsPipeline() {
-    auto vertCode = readFile("../../shaders/triangle.vert.spv");
-    auto fragCode = readFile("../../shaders/triangle.frag.spv");
+    // NOTE: exe is in <repo>/build, shaders are in <repo>/shaders
+    // so relative to exe: "../shaders/..."
+    auto vertCode = readFileExeRelative("../shaders/triangle.vert.spv");
+    auto fragCode = readFileExeRelative("../shaders/triangle.frag.spv");
 
     VkShaderModuleCreateInfo vertInfo{};
     vertInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -1158,7 +1201,7 @@ void VulkanContext::createCacheBugResources() {
     // 5) Create pipelines
 
     // Compute shader
-    auto compCode = readFile("../../shaders/cache_bug.comp.spv");
+    auto compCode = readFileExeRelative("../shaders/cache_bug.comp.spv");
     VkShaderModuleCreateInfo compInfo{};
     compInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     compInfo.codeSize = compCode.size();
@@ -1188,8 +1231,8 @@ void VulkanContext::createCacheBugResources() {
     vkDestroyShaderModule(device, compModule, nullptr);
 
     // Graphics shaders (fullscreen triangle VS + sampling FS)
-    auto vsCode = readFile("../../shaders/cache_fullscreen.vert.spv");
-    auto fsCode = readFile("../../shaders/cache_bug.frag.spv");
+    auto vsCode = readFileExeRelative("../shaders/cache_fullscreen.vert.spv");
+    auto fsCode = readFileExeRelative("../shaders/cache_bug.frag.spv");
 
     VkShaderModuleCreateInfo vsInfo{};
     vsInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
